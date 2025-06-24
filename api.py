@@ -17,14 +17,18 @@ from db_analyzer import DatabaseAnalyzer
 import psycopg2
 from psycopg2 import OperationalError
 from models import (
-    UserCreate, User, Token,
+    UserCreate, User, Token, UserRole, UserSettingsUpdate,
+    UserSearchRequest, PromoteUserRequest, UserSearchResult,
     WorkspaceCreate, Workspace, DatabaseConnection,
     SessionCreate, Session,
-    MessageCreate, Message, QueryResult
+    MessageCreate, Message, QueryResult,
+    EditQueryRequest, EditQueryResponse, ExecuteEditRequest, ExecuteSQLRequest
 )
 from auth import (
     authenticate_user, create_access_token,
     get_current_active_user, get_current_user,
+    get_current_admin_user, get_current_admin_user_with_edit_mode,
+    check_edit_permission, check_admin_permission,
     ACCESS_TOKEN_EXPIRE_MINUTES
 )
 from db_service import (
@@ -170,6 +174,129 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
 async def get_current_user_info(current_user: User = Depends(get_current_active_user)):
     """Get current user information"""
     return current_user
+
+
+# User settings endpoints
+@app.get("/auth/settings", response_model=Dict[str, Any])
+async def get_user_settings(current_user: User = Depends(get_current_active_user)):
+    """Get user's current settings"""
+    return {
+        "user_id": current_user.id,
+        "role": current_user.role,
+        "settings": current_user.settings.model_dump(),
+        "can_edit": check_edit_permission(current_user),
+        "is_admin": check_admin_permission(current_user)
+    }
+
+
+@app.put("/auth/settings", response_model=User)
+async def update_user_settings(
+    settings_update: UserSettingsUpdate,
+    current_user: User = Depends(get_current_active_user)
+):
+    """Update user settings"""
+    try:
+        updated_user = await UserService.update_user_settings(current_user.id, settings_update)
+        if not updated_user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        return updated_user
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+@app.post("/auth/toggle-edit-mode", response_model=User)
+async def toggle_edit_mode(current_user: User = Depends(get_current_admin_user)):
+    """Toggle edit mode for admin users"""
+    try:
+        updated_user = await UserService.toggle_edit_mode(current_user.id)
+        if not updated_user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        return updated_user
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+# Admin management endpoints
+@app.post("/admin/search-user", response_model=Optional[UserSearchResult])
+async def search_user_by_email(
+    search_req: UserSearchRequest,
+    current_user: User = Depends(get_current_admin_user)
+):
+    """Search for a user by email address (admin only)"""
+    try:
+        user_result = await UserService.search_user_by_email(search_req.email)
+        return user_result
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"User search failed: {str(e)}"
+        )
+
+
+@app.post("/admin/promote-user", response_model=User)
+async def promote_user_to_admin(
+    promote_req: PromoteUserRequest,
+    current_user: User = Depends(get_current_admin_user)
+):
+    """Promote a user to admin role (admin only)"""
+    try:
+        promoted_user = await UserService.promote_user_to_admin(
+            promote_req.user_email, 
+            current_user.id
+        )
+        
+        if not promoted_user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found or promotion failed"
+            )
+        
+        return promoted_user
+        
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"User promotion failed: {str(e)}"
+        )
+
+
+@app.get("/admin/users", response_model=List[UserSearchResult])
+async def get_all_users(
+    limit: int = 50,
+    skip: int = 0,
+    current_user: User = Depends(get_current_admin_user)
+):
+    """Get all users with pagination (admin only)"""
+    try:
+        users = await UserService.get_all_users(current_user.id, limit, skip)
+        return users
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve users: {str(e)}"
+        )
 
 
 # Workspace endpoints
@@ -658,11 +785,11 @@ async def query_with_session(
             current_user.id
         )
         
-        # Execute the query
-        result = sql_generator.execute_query(
-            query_req.question,
-            auto_fix=query_req.auto_fix,
-            max_attempts=query_req.max_attempts
+        # Use unified query processing that automatically detects edit vs fetch operations
+        result = sql_generator.process_unified_query(
+            question=query_req.question,
+            user_role=current_user.role.value,
+            edit_mode_enabled=current_user.settings.edit_mode_enabled
         )
         
         # Convert any Decimal objects to float for MongoDB compatibility
@@ -729,6 +856,23 @@ def format_query_result(result: Dict[str, Any]) -> Dict[str, Any]:
     # For conversational queries, just return the text
     if result.get("is_conversational", False):
         response["query_type"] = "conversational"
+        return response
+    
+    # For edit queries, return with edit-specific formatting
+    if result.get("is_edit_query", False):
+        response["query_type"] = result.get("query_type", "edit_sql")
+        response["sql"] = result.get("sql", "")
+        response["is_edit_query"] = True
+        response["requires_confirmation"] = result.get("requires_confirmation", False)
+        
+        # Include verification result if available
+        if "verification_result" in result:
+            response["verification_result"] = result["verification_result"]
+        
+        # Include error message if query failed
+        if not response["success"]:
+            response["error"] = result.get("error", "Unknown error")
+        
         return response
     
     # For multi-query analysis, format tables with headers
@@ -857,13 +1001,26 @@ async def refresh_workspace_schema(
         schema_analyzed = db_connection_manager.ensure_schema_analyzed(workspace_id)
         
         if schema_analyzed:
+            # Also refresh schema context in any active SQL generators for this workspace
+            refreshed_generators = []
+            for session_id, sql_generator in active_generators.items():
+                # Check if this generator belongs to this workspace
+                try:
+                    session = await SessionService.get_session_by_id(session_id)
+                    if session and session.workspace_id == workspace_id:
+                        if sql_generator.refresh_schema_context():
+                            refreshed_generators.append(session_id)
+                except Exception as e:
+                    print(f"Error refreshing schema context for session {session_id}: {e}")
+            
             # Get updated status
             status_info = db_connection_manager.get_workspace_status(workspace_id)
             return {
                 "success": True,
                 "message": "Schema analysis refreshed successfully",
                 "workspace_id": workspace_id,
-                "status": status_info
+                "status": status_info,
+                "refreshed_sessions": refreshed_generators
             }
         else:
             raise HTTPException(
@@ -875,6 +1032,137 @@ async def refresh_workspace_schema(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error refreshing schema: {str(e)}"
+        )
+
+
+# Execute SQL endpoint - for executing edit queries after user review
+@app.post("/sessions/{session_id}/execute-sql")
+async def execute_sql_query(
+    session_id: str,
+    execute_req: ExecuteSQLRequest,
+    current_user: User = Depends(get_current_admin_user_with_edit_mode)
+):
+    """Execute an SQL query (used for edit operations after user confirmation)"""
+    # Get the session
+    session = await SessionService.get_session(session_id, current_user.id)
+    
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found"
+        )
+    
+    # Get the SQL generator for this session
+    if session_id not in active_generators:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No active SQL generator for this session"
+        )
+    
+    sql_generator = active_generators[session_id]
+    
+    try:
+        # Create the user message for the execution
+        user_message = await MessageService.create_message(
+            MessageCreate(
+                content=f"EXECUTE SQL: {execute_req.sql}",
+                role="user",
+                session_id=session_id
+            ),
+            current_user.id
+        )
+        
+        # Execute the SQL query with automatic schema updates
+        result = sql_generator.execute_edit_query_with_schema_update(execute_req.sql)
+        
+        # Convert any Decimal objects to float for MongoDB compatibility
+        converted_result = convert_decimals_to_float(result)
+        
+        # Create QueryResult object from the execution result
+        query_result = QueryResult(
+            success=converted_result.get("success", False),
+            sql=converted_result.get("sql"),
+            results=converted_result.get("results"),
+            error=converted_result.get("error"),
+            execution_time=converted_result.get("execution_time"),
+            is_conversational=False,
+            is_multi_query=False,
+            is_why_analysis=False,
+            query_type="edit_execution",
+            analysis_type=None,
+            source="edit_mode",
+            confidence=100,
+            auto_fixed=False,
+            fix_attempts=0,
+            pagination=None,
+            tables=None
+        )
+        
+        # Create the assistant message
+        if converted_result.get("success"):
+            affected_rows = converted_result.get("affected_rows", 0)
+            response_text = f"SQL executed successfully. {affected_rows} rows affected."
+        else:
+            response_text = f"SQL execution failed: {converted_result.get('error', 'Unknown error')}"
+        
+        assistant_message = await MessageService.create_message(
+            MessageCreate(
+                content=response_text,
+                role="assistant",
+                session_id=session_id,
+                query_result=query_result
+            ),
+            current_user.id
+        )
+        
+        # Store in memory for future reference
+        if converted_result.get("success"):
+            sql_generator._store_in_memory(
+                f"EXECUTED: {execute_req.sql}",
+                execute_req.sql,
+                converted_result.get("results")
+            )
+        
+        # Format the response
+        response = {
+            "success": converted_result.get("success", False),
+            "sql": execute_req.sql,
+            "results": converted_result.get("results"),
+            "error": converted_result.get("error"),
+            "execution_time": converted_result.get("execution_time"),
+            "affected_rows": converted_result.get("affected_rows"),
+            "is_edit_execution": True,
+            "user_message": user_message,
+            "assistant_message": assistant_message
+        }
+        
+        # Include transaction information if available
+        if "transaction_mode" in converted_result:
+            response["transaction_mode"] = converted_result["transaction_mode"]
+            response["query_count"] = converted_result.get("query_count", 1)
+            
+            if "query_results" in converted_result:
+                response["query_results"] = converted_result["query_results"]
+            
+            if "rollback_performed" in converted_result:
+                response["rollback_performed"] = converted_result["rollback_performed"]
+            
+            if "failed_at_query" in converted_result:
+                response["failed_at_query"] = converted_result["failed_at_query"]
+        
+        # Include schema refresh information if available
+        if "schema_refreshed" in converted_result:
+            response["schema_refreshed"] = converted_result["schema_refreshed"]
+        
+        if "warning" in converted_result:
+            response["warning"] = converted_result["warning"]
+        
+        return response
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"SQL execution failed: {str(e)}"
         )
 
 

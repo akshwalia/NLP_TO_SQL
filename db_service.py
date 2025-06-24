@@ -3,7 +3,8 @@ from datetime import datetime
 from bson import ObjectId
 
 from models import (
-    UserCreate, UserInDB, User,
+    UserCreate, UserInDB, User, UserRole, UserSettings, UserSettingsUpdate,
+    UserSearchResult, PromoteUserRequest,
     WorkspaceCreate, WorkspaceInDB, Workspace,
     SessionCreate, SessionInDB, Session,
     MessageCreate, MessageInDB, Message,
@@ -23,9 +24,10 @@ class UserService:
         if users_collection.find_one({"email": user.email}):
             raise ValueError(f"User with email {user.email} already exists")
         
-        # Create a new user
+        # Create a new user with default role as viewer
         user_in_db = UserInDB(
             **user.model_dump(exclude={"password"}),
+            role=UserRole.VIEWER,  # Default role
             hashed_password=get_password_hash(user.password)
         )
         
@@ -60,6 +62,143 @@ class UserService:
             {"_id": user_id},
             {"$set": {"last_login": datetime.utcnow()}}
         )
+    
+    @staticmethod
+    async def update_user_settings(user_id: str, settings_update: UserSettingsUpdate) -> Optional[User]:
+        """Update user settings"""
+        # Only allow admin users to enable edit mode
+        current_user = await UserService.get_user(user_id)
+        if not current_user:
+            return None
+        
+        # Build update data
+        update_data = {}
+        if settings_update.edit_mode_enabled is not None:
+            # Only admin users can enable edit mode
+            if current_user.role != UserRole.ADMIN and settings_update.edit_mode_enabled:
+                raise ValueError("Only admin users can enable edit mode")
+            update_data["settings.edit_mode_enabled"] = settings_update.edit_mode_enabled
+        
+        # Update last activity
+        update_data["settings.last_activity"] = datetime.utcnow()
+        
+        # Update in database
+        result = users_collection.update_one(
+            {"_id": user_id},
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            return None
+        
+        # Return updated user
+        return await UserService.get_user(user_id)
+    
+    @staticmethod
+    async def toggle_edit_mode(user_id: str) -> Optional[User]:
+        """Toggle edit mode for an admin user"""
+        current_user = await UserService.get_user(user_id)
+        if not current_user:
+            return None
+        
+        if current_user.role != UserRole.ADMIN:
+            raise ValueError("Only admin users can use edit mode")
+        
+        # Toggle edit mode
+        new_edit_mode = not current_user.settings.edit_mode_enabled
+        
+        settings_update = UserSettingsUpdate(edit_mode_enabled=new_edit_mode)
+        return await UserService.update_user_settings(user_id, settings_update)
+    
+    @staticmethod
+    async def search_user_by_email(email: str) -> Optional[UserSearchResult]:
+        """Search for a user by email address"""
+        user_dict = users_collection.find_one({"email": email})
+        
+        if not user_dict:
+            return None
+        
+        # Convert ObjectId to string
+        user_dict["_id"] = str(user_dict["_id"])
+        
+        # Create UserSearchResult (excludes sensitive information)
+        return UserSearchResult(
+            id=user_dict["_id"],
+            email=user_dict["email"],
+            first_name=user_dict.get("first_name"),
+            last_name=user_dict.get("last_name"),
+            role=user_dict.get("role", UserRole.VIEWER),
+            is_active=user_dict.get("is_active", True),
+            created_at=user_dict.get("created_at", datetime.utcnow())
+        )
+    
+    @staticmethod
+    async def promote_user_to_admin(user_email: str, promoting_admin_id: str) -> Optional[User]:
+        """Promote a user to admin role"""
+        # First check if the promoting user is an admin
+        promoting_admin = await UserService.get_user(promoting_admin_id)
+        if not promoting_admin or promoting_admin.role != UserRole.ADMIN:
+            raise ValueError("Only admin users can promote other users")
+        
+        # Find the user to promote
+        user_to_promote = users_collection.find_one({"email": user_email})
+        if not user_to_promote:
+            raise ValueError(f"User with email {user_email} not found")
+        
+        # Check if user is already an admin
+        if user_to_promote.get("role") == UserRole.ADMIN:
+            raise ValueError(f"User {user_email} is already an admin")
+        
+        # Update user to admin role with edit mode disabled by default
+        update_data = {
+            "role": UserRole.ADMIN,
+            "is_admin": True,  # Keep for backward compatibility
+            "settings.edit_mode_enabled": False,  # Start with edit mode disabled
+            "settings.last_activity": datetime.utcnow()
+        }
+        
+        result = users_collection.update_one(
+            {"email": user_email},
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            return None
+        
+        # Return the updated user
+        updated_user_dict = users_collection.find_one({"email": user_email})
+        updated_user_dict["_id"] = str(updated_user_dict["_id"])
+        
+        return User(**updated_user_dict)
+    
+    @staticmethod
+    async def get_all_users(requesting_admin_id: str, limit: int = 50, skip: int = 0) -> List[UserSearchResult]:
+        """Get all users (admin only)"""
+        # Check if the requesting user is an admin
+        requesting_admin = await UserService.get_user(requesting_admin_id)
+        if not requesting_admin or requesting_admin.role != UserRole.ADMIN:
+            raise ValueError("Only admin users can view all users")
+        
+        # Get users with pagination
+        users_cursor = users_collection.find({}).limit(limit).skip(skip).sort("created_at", -1)
+        users = list(users_cursor)
+        
+        # Convert to UserSearchResult objects
+        user_results = []
+        for user_dict in users:
+            user_dict["_id"] = str(user_dict["_id"])
+            user_result = UserSearchResult(
+                id=user_dict["_id"],
+                email=user_dict["email"],
+                first_name=user_dict.get("first_name"),
+                last_name=user_dict.get("last_name"),
+                role=user_dict.get("role", UserRole.VIEWER),
+                is_active=user_dict.get("is_active", True),
+                created_at=user_dict.get("created_at", datetime.utcnow())
+            )
+            user_results.append(user_result)
+        
+        return user_results
 
 
 class WorkspaceService:
@@ -214,6 +353,23 @@ class SessionService:
             "_id": session_id,
             "user_id": user_id
         })
+        
+        if not session:
+            return None
+        
+        # Convert ObjectIds to strings
+        session["_id"] = str(session["_id"])
+        if isinstance(session["workspace_id"], ObjectId):
+            session["workspace_id"] = str(session["workspace_id"])
+        if isinstance(session["user_id"], ObjectId):
+            session["user_id"] = str(session["user_id"])
+        
+        return Session(**session)
+    
+    @staticmethod
+    async def get_session_by_id(session_id: str) -> Optional[Session]:
+        """Get a session by ID without user restriction (for internal use)"""
+        session = sessions_collection.find_one({"_id": session_id})
         
         if not session:
             return None

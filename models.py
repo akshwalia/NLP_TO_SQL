@@ -41,6 +41,14 @@ class PyObjectId(str):
         )
 
 
+# Role enum for users
+from enum import Enum
+
+class UserRole(str, Enum):
+    ADMIN = "admin"
+    VIEWER = "viewer"
+
+
 # User models
 class UserCreate(BaseModel):
     email: EmailStr
@@ -49,13 +57,20 @@ class UserCreate(BaseModel):
     last_name: Optional[str] = None
 
 
+class UserSettings(BaseModel):
+    edit_mode_enabled: bool = False  # Only meaningful for admin users
+    last_activity: Optional[datetime] = None
+
+
 class User(BaseModel):
     id: PyObjectId = Field(default_factory=lambda: str(ObjectId()), alias="_id")
     email: EmailStr
     first_name: Optional[str] = None
     last_name: Optional[str] = None
+    role: UserRole = UserRole.VIEWER
     is_active: bool = True
-    is_admin: bool = False
+    is_admin: bool = False  # Keep for backward compatibility
+    settings: UserSettings = Field(default_factory=UserSettings)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_login: Optional[datetime] = None
     
@@ -215,3 +230,52 @@ class Message(BaseModel):
 
 class MessageInDB(Message):
     pass
+
+
+# Edit mode models
+class EditQueryRequest(BaseModel):
+    question: str
+    session_id: PyObjectId
+
+
+class EditQueryResponse(BaseModel):
+    success: bool
+    question: str
+    sql: str
+    verification_result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    is_edit_query: bool = True
+    requires_confirmation: bool = True
+
+
+class ExecuteEditRequest(BaseModel):
+    sql: str
+    session_id: PyObjectId
+    user_confirmed: bool = True
+
+
+class ExecuteSQLRequest(BaseModel):
+    sql: str
+
+
+class UserSettingsUpdate(BaseModel):
+    edit_mode_enabled: Optional[bool] = None
+
+
+# Admin management models
+class UserSearchRequest(BaseModel):
+    email: str
+
+
+class PromoteUserRequest(BaseModel):
+    user_email: str
+
+
+class UserSearchResult(BaseModel):
+    id: str
+    email: EmailStr
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    role: UserRole
+    is_active: bool
+    created_at: datetime

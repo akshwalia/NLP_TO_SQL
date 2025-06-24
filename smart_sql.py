@@ -327,6 +327,111 @@ ANALYSIS_APPROACH: [brief description of how these queries will help answer the 
         # Prepare schema context
         self.schema_context = None
         self.example_patterns = None
+        
+        # Define edit mode prompts
+        self._initialize_edit_mode_prompts()
+    
+    def _initialize_edit_mode_prompts(self):
+        """Initialize prompts for edit mode operations"""
+        memory_var = "{memory}\n\n" if self.use_memory else ""
+        
+        # Edit mode SQL generation prompt - more cautious and explicit about modifications
+        self.edit_sql_prompt = PromptTemplate(
+            input_variables=["schema", "question", "examples"] + (["memory"] if self.use_memory else []),
+            template=f"""You are an expert SQL developer specializing in PostgreSQL databases with EDIT MODE ENABLED. Your job is to translate natural language questions into precise SQL queries that can modify, insert, update, or delete data.
+
+{memory_var}### DATABASE SCHEMA:
+{{schema}}
+
+### EXAMPLES OF GOOD SQL PATTERNS:
+{{examples}}
+
+### TASK:
+Convert the following question into a PostgreSQL SQL query. This is an EDIT MODE request, so you can generate INSERT, UPDATE, DELETE, or SELECT queries as appropriate:
+"{{question}}"
+
+### GUIDELINES FOR EDIT MODE:
+1. **WRITE OPERATIONS ALLOWED**: You can generate INSERT, UPDATE, DELETE, and SELECT queries
+2. **BE CAUTIOUS**: For destructive operations (UPDATE/DELETE), always include appropriate WHERE clauses to limit scope
+3. **EXPLICIT CONDITIONS**: Never generate UPDATE or DELETE without specific WHERE conditions unless explicitly requested for all records
+4. **DATA VALIDATION**: Consider data integrity and foreign key constraints when generating modification queries
+5. **TRANSACTION SAFETY**: Design queries that are safe and won't cause unintended data loss
+6. **SPECIFIC ACTIONS**: If the user asks to "add", "insert", "create" → use INSERT; "update", "modify", "change" → use UPDATE; "delete", "remove" → use DELETE
+7. **REQUIRE SPECIFICITY**: For UPDATE/DELETE operations, require specific identifiers (IDs, names, etc.) in the question
+8. **BATCH OPERATIONS**: For bulk operations, be explicit about what records will be affected
+9. **POSTGRESQL SYNTAX**: Use proper PostgreSQL syntax including RETURNING clauses when appropriate
+10. **SAFETY FIRST**: If the request is ambiguous about which records to modify, ask for clarification rather than making assumptions
+11: **MULTI QUERY**: If you generate multiple queries to meet the goal, each query must be separated by "<----->"
+
+### IMPORTANT SAFETY RULES:
+- Never generate UPDATE or DELETE without WHERE clauses unless explicitly requested for all records
+- Always validate that the requested operation makes sense given the schema
+- For INSERT operations, ensure all required fields are provided or have defaults
+- Use transactions implicitly by designing safe, atomic operations
+
+### OUTPUT FORMAT:
+Provide ONLY the SQL query with no additional text, explanation, or markdown formatting.
+"""
+        )
+        
+        # Edit mode verification prompt - double-checks the generated SQL
+        self.edit_verification_prompt = PromptTemplate(
+            input_variables=["schema", "sql", "original_question"],
+            template=f"""You are a database safety expert reviewing SQL queries for edit operations. Your job is to verify that the SQL query is safe, correct, and matches the user's intent.
+
+### DATABASE SCHEMA:
+{{schema}}
+
+### ORIGINAL USER REQUEST:
+"{{original_question}}"
+
+### GENERATED SQL QUERY:
+```sql
+{{sql}}
+```
+
+### VERIFICATION CHECKLIST:
+Analyze the SQL query and provide a verification report covering these aspects:
+
+1. **SAFETY CHECK**: 
+   - Does the query have appropriate WHERE clauses for UPDATE/DELETE operations?
+   - Will this query affect only the intended records?
+   - Are there any risks of unintended data loss or corruption?
+
+2. **CORRECTNESS CHECK**:
+   - Does the SQL syntax appear correct for PostgreSQL?
+   - Are all referenced tables and columns valid according to the schema?
+   - Does the query logic match the user's request?
+
+3. **COMPLETENESS CHECK**:
+   - Does the query fully address the user's request?
+   - Are all required fields included for INSERT operations?
+   - Are data types and constraints respected?
+
+4. **IMPACT ASSESSMENT**:
+   - How many records will likely be affected?
+   - What are the potential consequences of this operation?
+   - Are there any dependencies or cascading effects to consider?
+
+### OUTPUT FORMAT:
+Provide a JSON response with the following structure:
+{{
+    "is_safe": true/false,
+    "is_correct": true/false,
+    "safety_issues": ["list of any safety concerns"],
+    "correctness_issues": ["list of any syntax or logical errors"],
+    "impact_assessment": "description of what this query will do",
+    "estimated_affected_records": "estimate or 'unknown'",
+    "recommendations": ["any suggestions for improvement"],
+    "overall_verdict": "SAFE_TO_EXECUTE" or "REQUIRES_REVIEW" or "DO_NOT_EXECUTE",
+    "explanation": "brief explanation of the verdict"
+}}
+"""
+        )
+        
+        # Create edit mode chains
+        self.edit_sql_chain = self.edit_sql_prompt | self.llm
+        self.edit_verification_chain = self.edit_verification_prompt | self.llm
     
     def _initialize_memory(self, persist_dir: str) -> Optional[BaseMemory]:
         """Initialize vector store memory with Gemini embeddings"""
@@ -2523,6 +2628,500 @@ CONVERSATIONAL - if the question is asking for information, explanation, or conv
             print(f"Error in conversational classification: {e}")
             # Fall back to the keyword-based approach
             return not self._is_sql_question(question)
+    
+    def _is_edit_operation(self, question: str) -> bool:
+        """Use LLM to intelligently determine if a question requires edit operations"""
+        try:
+            # Prepare schema context if not already done
+            if self.schema_context is None:
+                self._prepare_schema_context()
+            
+            # Create a prompt to classify the query type
+            classification_prompt = PromptTemplate(
+                input_variables=["schema", "question"],
+                template="""You are an expert at classifying database queries. Your task is to determine if a question requires data modification (INSERT, UPDATE, DELETE) or just data retrieval (SELECT).
+
+### DATABASE SCHEMA:
+{schema}
+
+### USER QUESTION:
+"{question}"
+
+### TASK:
+Analyze the question and determine if it requires:
+- EDIT operations (INSERT, UPDATE, DELETE) - modifying data in the database
+- FETCH operations (SELECT) - retrieving/reading data from the database
+
+### EXAMPLES:
+
+EDIT OPERATIONS:
+- "Add a new customer named John Doe"
+- "Update the price of product X to $50"
+- "Delete all orders from last year"
+- "Insert a new record for employee Sarah"
+- "Change the status of order 123 to completed"
+- "Remove inactive users"
+- "Set the discount to 10% for all premium customers"
+
+FETCH OPERATIONS:
+- "Show me all customers"
+- "What are the top selling products?"
+- "List orders from this month"
+- "Find customers in New York"
+- "Calculate total revenue"
+- "Show product categories"
+- "Get user details for John"
+
+### RESPONSE:
+Respond with ONLY one of these two words:
+- EDIT (if the question requires data modification)
+- FETCH (if the question requires data retrieval only)
+"""
+            )
+            
+            # Create classification chain
+            classification_chain = classification_prompt | self.llm
+            
+            # Get classification
+            response = classification_chain.invoke({
+                "schema": self.schema_context,
+                "question": question
+            })
+            
+            classification = self._extract_response_content(response).strip().upper()
+            
+            # Return True if it's an edit operation
+            return "EDIT" in classification
+            
+        except Exception as e:
+            print(f"Error in LLM-based edit operation detection: {e}")
+            # Fallback to pattern-based detection
+            edit_patterns = [
+                r'\b(insert|add|create|new)\b',
+                r'\b(update|modify|change|edit|alter)\b',
+                r'\b(delete|remove|drop|clear)\b',
+                r'\b(set|assign|make)\b.*\b(equal|to|as)\b',
+                r'\b(increase|decrease|increment|decrement)\b',
+                r'\b(save|store|record)\b',
+                r'\b(fix|correct|repair)\b',
+            ]
+            
+            question_lower = question.lower()
+            
+            # Check against edit patterns
+            for pattern in edit_patterns:
+                if re.search(pattern, question_lower):
+                    return True
+            
+            return False
+    
+    def generate_edit_sql(self, question: str) -> Dict[str, Any]:
+        """Generate SQL for edit mode operations (INSERT, UPDATE, DELETE)"""
+        start_time = time.time()
+        
+        try:
+            # Prepare schema context if not already done
+            if self.schema_context is None or self.example_patterns is None:
+                self._prepare_schema_context()
+            
+            # Prepare memory context
+            memory_context = ""
+            if self.use_memory:
+                memory_context = self._prepare_memory_for_query(question)
+            
+            # Generate SQL using edit mode prompt
+            inputs = {
+                "schema": self.schema_context,
+                "question": question,
+                "examples": self.example_patterns
+            }
+            
+            if self.use_memory:
+                inputs["memory"] = memory_context
+            
+            # Invoke the edit SQL chain
+            response = self.edit_sql_chain.invoke(inputs)
+            sql = self._extract_response_content(response).strip()
+            
+            # Clean up the SQL
+            if sql.startswith("```sql"):
+                sql = sql[6:]
+            if sql.endswith("```"):
+                sql = sql[:-3]
+            sql = sql.strip()
+            
+            execution_time = time.time() - start_time
+            
+            return {
+                "success": True,
+                "question": question,
+                "sql": sql,
+                "execution_time": execution_time,
+                "is_edit_query": True,
+                "source": "edit_mode"
+            }
+            
+        except Exception as e:
+            execution_time = time.time() - start_time
+            return {
+                "success": False,
+                "question": question,
+                "sql": None,
+                "error": str(e),
+                "execution_time": execution_time,
+                "is_edit_query": True,
+                "source": "edit_mode"
+            }
+    
+    def verify_edit_sql(self, sql: str, original_question: str) -> Dict[str, Any]:
+        """Verify that an edit SQL query is safe and correct"""
+        start_time = time.time()
+        
+        try:
+            # Prepare schema context if not already done
+            if self.schema_context is None:
+                self._prepare_schema_context()
+            
+            # Generate verification report
+            inputs = {
+                "schema": self.schema_context,
+                "sql": sql,
+                "original_question": original_question
+            }
+            
+            # Invoke the verification chain
+            response = self.edit_verification_chain.invoke(inputs)
+            verification_text = self._extract_response_content(response).strip()
+            
+            # Try to parse JSON response
+            try:
+                import json
+                verification_result = json.loads(verification_text)
+            except json.JSONDecodeError:
+                # If JSON parsing fails, create a basic structure
+                verification_result = {
+                    "is_safe": False,
+                    "is_correct": False,
+                    "safety_issues": ["Failed to parse verification response"],
+                    "correctness_issues": ["Unable to verify"],
+                    "impact_assessment": "Unknown",
+                    "estimated_affected_records": "unknown",
+                    "recommendations": ["Manual review required"],
+                    "overall_verdict": "REQUIRES_REVIEW",
+                    "explanation": "Verification system encountered an error"
+                }
+            
+            execution_time = time.time() - start_time
+            
+            return {
+                "success": True,
+                "verification_result": verification_result,
+                "execution_time": execution_time,
+                "raw_response": verification_text
+            }
+            
+        except Exception as e:
+            execution_time = time.time() - start_time
+            return {
+                "success": False,
+                "error": str(e),
+                "execution_time": execution_time,
+                "verification_result": {
+                    "is_safe": False,
+                    "is_correct": False,
+                    "overall_verdict": "DO_NOT_EXECUTE",
+                    "explanation": f"Verification failed: {str(e)}"
+                }
+            }
+    
+    def execute_edit_query(self, sql: str) -> Dict[str, Any]:
+        """Execute an edit query after verification and user confirmation"""
+        start_time = time.time()
+        
+        try:
+            # Clean the SQL first (remove literal \n characters)
+            cleaned_sql = sql.replace('\\n', '\n').replace('\\t', '\t').strip()
+            
+            # Split SQL by separator to handle multiple statements
+            sql_statements = [stmt.strip() for stmt in cleaned_sql.split('<----->') if stmt.strip()]
+
+            # Clean the sql statements
+            sql_statements = [stmt.replace('\\n', '\n').replace('\\t', '\t').strip() for stmt in sql_statements]
+
+            # Print the sql statements
+            print(f"SQL Statements: {sql_statements}")
+            
+            if len(sql_statements) == 1:
+                # Single query execution (no transaction needed)
+                return self._execute_single_query(sql_statements[0], start_time)
+            else:
+                # Multiple queries - execute with transaction support
+                return self._execute_multiple_queries_with_transaction(sql_statements, start_time)
+                
+        except Exception as e:
+            execution_time = time.time() - start_time
+            # Clean SQL for error reporting too
+            cleaned_sql = sql.replace('\\n', '\n').replace('\\t', '\t').strip()
+            return {
+                "success": False,
+                "sql": cleaned_sql,
+                "results": [],
+                "error": str(e),
+                "execution_time": execution_time,
+                "is_edit_execution": True,
+                "affected_rows": 0,
+                "query_count": 0
+            }
+
+    def _execute_multiple_queries_with_transaction(self, sql_statements: List[str], start_time: float) -> Dict[str, Any]:
+        """Execute multiple SQL queries with transaction support (rollback on failure)"""
+        try:
+            # Use the new transaction-aware method from db_analyzer
+            success, results_list, error = self.db_analyzer.execute_query_with_transaction(sql_statements)
+            execution_time = time.time() - start_time
+            
+            if success:
+                # Calculate total affected rows from all queries
+                total_affected_rows = sum(result.get("affected_rows", 0) for result in results_list)
+                
+                # Collect all result data
+                all_results = []
+                for result in results_list:
+                    if result.get("results"):
+                        all_results.extend(result["results"])
+                
+                return {
+                    "success": True,
+                    "sql": '<----->'.join(sql_statements),
+                    "results": all_results,
+                    "execution_time": execution_time,
+                    "is_edit_execution": True,
+                    "affected_rows": total_affected_rows,
+                    "query_count": len(sql_statements),
+                    "query_results": results_list,
+                    "transaction_mode": True
+                }
+            else:
+                # Transaction failed and was rolled back
+                failed_query_num = len([r for r in results_list if r.get("success", True)]) + 1
+                
+                return {
+                    "success": False,
+                    "sql": '<----->'.join(sql_statements),
+                    "results": [],
+                    "error": f"{error} (Transaction rolled back)",
+                    "execution_time": execution_time,
+                    "is_edit_execution": True,
+                    "affected_rows": 0,
+                    "query_count": len(sql_statements),
+                    "failed_at_query": failed_query_num,
+                    "query_results": results_list,
+                    "transaction_mode": True,
+                    "rollback_performed": True
+                }
+                
+        except Exception as e:
+            execution_time = time.time() - start_time
+            return {
+                "success": False,
+                "sql": '<----->'.join(sql_statements),
+                "results": [],
+                "error": f"Transaction execution failed: {str(e)}",
+                "execution_time": execution_time,
+                "is_edit_execution": True,
+                "affected_rows": 0,
+                "query_count": len(sql_statements),
+                "transaction_mode": True,
+                "rollback_performed": True
+            }
+    
+    def _execute_single_query(self, sql: str, start_time: float) -> Dict[str, Any]:
+        """Execute a single SQL query"""
+        # Execute the query - db_analyzer.execute_query returns (success, results, error)
+        success, raw_results, error = self.db_analyzer.execute_query(sql)
+        execution_time = time.time() - start_time
+        
+        # Check if execution failed
+        if not success:
+            return {
+                "success": False,
+                "sql": sql,
+                "results": [],
+                "error": error or "Query execution failed",
+                "execution_time": execution_time,
+                "is_edit_execution": True,
+                "affected_rows": 0,
+                "query_count": 1
+            }
+        
+        # Handle different result types
+        if isinstance(raw_results, list):
+            results = raw_results
+            affected_rows = len(raw_results)
+        elif isinstance(raw_results, (int, str)):
+            results = []
+            affected_rows = int(raw_results) if str(raw_results).isdigit() else 0
+        elif raw_results is None:
+            results = []
+            affected_rows = 0
+        elif hasattr(raw_results, 'rowcount'):
+            results = []
+            affected_rows = raw_results.rowcount
+        else:
+            results = []
+            affected_rows = 1 if raw_results else 0
+        
+        return {
+            "success": True,
+            "sql": sql,
+            "results": results,
+            "execution_time": execution_time,
+            "is_edit_execution": True,
+            "affected_rows": affected_rows,
+            "query_count": 1
+        }
+    
+    def process_unified_query(self, question: str, user_role: str = "viewer", edit_mode_enabled: bool = False) -> Dict[str, Any]:
+        """
+        Unified query processing that automatically detects edit vs fetch operations
+        and handles them appropriately based on user permissions
+        """
+        start_time = time.time()
+        
+        try:
+            # Step 1: Use LLM to determine if this is an edit or fetch operation
+            is_edit_operation = self._is_edit_operation(question)
+            
+            # Step 2: Handle based on operation type and user permissions
+            if is_edit_operation:
+                # Check if user has permission for edit operations
+                if user_role != "admin" or not edit_mode_enabled:
+                    execution_time = time.time() - start_time
+                    return {
+                        "success": False,
+                        "question": question,
+                        "error": "Edit operations require admin access with edit mode enabled",
+                        "execution_time": execution_time,
+                        "is_edit_operation": True,
+                        "is_edit_query": True,
+                        "requires_admin": True,
+                        "query_type": "edit_blocked"
+                    }
+                
+                # Generate edit SQL using edit mode prompts
+                edit_result = self.generate_edit_sql(question)
+                
+                if not edit_result["success"]:
+                    return edit_result
+                
+                # Verify the generated SQL
+                verification_result = self.verify_edit_sql(edit_result["sql"], question)
+                
+                execution_time = time.time() - start_time
+                
+                return {
+                    "success": True,
+                    "question": question,
+                    "sql": edit_result["sql"],
+                    "execution_time": execution_time,
+                    "is_edit_operation": True,
+                    "is_edit_query": True,
+                    "requires_confirmation": True,
+                    "verification_result": verification_result.get("verification_result"),
+                    "query_type": "edit_sql",
+                    "text": f"I've generated an edit query for you. Please review the SQL and click execute if you're satisfied with it."
+                }
+            
+            else:
+                # Handle as regular fetch operation
+                fetch_result = self.execute_query(question, auto_fix=True, max_attempts=2)
+                
+                # Add flags to indicate this was processed as fetch operation
+                fetch_result["is_edit_operation"] = False
+                fetch_result["is_edit_query"] = False
+                fetch_result["query_type"] = fetch_result.get("query_type", "fetch")
+                
+                return fetch_result
+                
+        except Exception as e:
+            execution_time = time.time() - start_time
+            return {
+                "success": False,
+                "question": question,
+                "error": str(e),
+                "execution_time": execution_time,
+                "is_edit_operation": None,
+                "is_edit_query": False,
+                "query_type": "error"
+            }
+
+    def refresh_schema_context(self) -> bool:
+        """
+        Refresh the schema context after potential schema changes
+        
+        Returns:
+            True if schema was refreshed successfully, False otherwise
+        """
+        try:
+            # Re-analyze the schema
+            self.db_analyzer.analyze_schema()
+            
+            # Update the prepared schema context
+            self._prepare_schema_context()
+            
+            print("Schema context refreshed successfully")
+            return True
+        except Exception as e:
+            print(f"Error refreshing schema context: {e}")
+            return False
+
+    def check_and_refresh_schema_if_needed(self, executed_sql: str) -> bool:
+        """
+        Check if the executed SQL requires schema refresh and refresh if needed
+        
+        Args:
+            executed_sql: The SQL that was executed
+            
+        Returns:
+            True if schema was refreshed or no refresh was needed, False if refresh failed
+        """
+        # Check if the SQL contains schema-changing operations
+        schema_changing_keywords = [
+            'CREATE TABLE', 'DROP TABLE', 'ALTER TABLE', 
+            'CREATE INDEX', 'DROP INDEX', 'CREATE VIEW', 'DROP VIEW',
+            'CREATE SCHEMA', 'DROP SCHEMA', 'RENAME TABLE',
+            'ADD COLUMN', 'DROP COLUMN', 'RENAME COLUMN',
+            'CREATE SEQUENCE', 'DROP SEQUENCE', 'TRUNCATE TABLE'
+        ]
+        
+        sql_upper = executed_sql.upper().strip()
+        needs_refresh = any(keyword in sql_upper for keyword in schema_changing_keywords)
+        
+        if needs_refresh:
+            print("Schema-changing operation detected, refreshing schema context...")
+            return self.refresh_schema_context()
+        
+        return True  # No refresh needed
+
+    def execute_edit_query_with_schema_update(self, sql: str) -> Dict[str, Any]:
+        """
+        Execute an edit query and handle schema updates if needed
+        
+        This is an enhanced version of execute_edit_query that automatically
+        handles schema context updates for schema-changing operations
+        """
+        # Execute the query first
+        result = self.execute_edit_query(sql)
+        
+        # If the query was successful, check if we need to refresh schema
+        if result.get("success", False):
+            schema_refreshed = self.check_and_refresh_schema_if_needed(sql)
+            result["schema_refreshed"] = schema_refreshed
+            
+            if not schema_refreshed:
+                result["warning"] = "Query executed successfully but schema context refresh failed. Future queries may not reflect schema changes."
+        
+        return result
 
 
 if __name__ == "__main__":

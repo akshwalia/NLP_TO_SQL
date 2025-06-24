@@ -483,11 +483,22 @@ class DatabaseAnalyzer:
                                 row_dict[column] = value
                             data.append(row_dict)
                         
+                        # Commit the transaction for write operations
+                        if query.strip().upper().startswith(('INSERT', 'UPDATE', 'DELETE', 'ALTER', 'DROP', 'CREATE', 'TRUNCATE', 'MERGE', 'RENAME')):
+                            conn.commit()
+                        
                         cursor.close()
                         return True, data, None
                     else:
+                        # For non-SELECT queries (INSERT, UPDATE, DELETE), return rowcount
+                        affected_rows = cursor.rowcount
+                        
+                        # Commit the transaction for write operations
+                        if query.strip().upper().startswith(('INSERT', 'UPDATE', 'DELETE', 'ALTER', 'DROP', 'CREATE', 'TRUNCATE', 'MERGE', 'RENAME')):
+                            conn.commit()
+                        
                         cursor.close()
-                        return True, [], None
+                        return True, affected_rows, None
             else:
                 # Fallback to SQLAlchemy engine
                 with self.engine.connect() as connection:
@@ -507,12 +518,422 @@ class DatabaseAnalyzer:
                                 row_dict[column] = value
                             data.append(row_dict)
                         
+                        # Commit for write operations
+                        if query.strip().upper().startswith(('INSERT', 'UPDATE', 'DELETE')):
+                            connection.commit()
+                        
                         return True, data, None
                     else:
-                        return True, [], None
+                        # For non-SELECT queries, return rowcount
+                        affected_rows = result.rowcount
+                        
+                        # Commit for write operations
+                        if query.strip().upper().startswith(('INSERT', 'UPDATE', 'DELETE')):
+                            connection.commit()
+                        
+                        return True, affected_rows, None
                 
         except Exception as e:
             return False, None, str(e)
+
+    def execute_query_with_transaction(self, queries: List[str]) -> Tuple[bool, List[Any], Optional[str]]:
+        """
+        Execute multiple queries in a single transaction with rollback support
+        
+        Args:
+            queries: List of SQL queries to execute in transaction
+            
+        Returns:
+            Tuple of (success, results_list, error_message)
+        """
+        results = []
+        
+        try:
+            # Use connection pool if available, otherwise fall back to engine
+            if self.connection_manager and self.workspace_id:
+                with self.connection_manager.get_connection(self.workspace_id) as conn:
+                    # Start transaction explicitly
+                    conn.autocommit = False
+                    cursor = conn.cursor()
+                    
+                    try:
+                        for i, query in enumerate(queries):
+                            cursor.execute(query)
+                            
+                            # Check if query returns rows
+                            if cursor.description:
+                                # Get column names
+                                columns = [desc[0] for desc in cursor.description]
+                                rows = cursor.fetchall()
+                                
+                                # Convert to list of dictionaries
+                                data = []
+                                for row in rows:
+                                    row_dict = {}
+                                    for idx, column in enumerate(columns):
+                                        value = row[idx]
+                                        # Convert non-serializable types to strings for JSON compatibility
+                                        if isinstance(value, (pd.Timestamp, pd.Timedelta)):
+                                            value = str(value)
+                                        row_dict[column] = value
+                                    data.append(row_dict)
+                                
+                                results.append({
+                                    "query_number": i + 1,
+                                    "sql": query,
+                                    "success": True,
+                                    "results": data,
+                                    "affected_rows": len(data),
+                                    "error": None
+                                })
+                            else:
+                                # For non-SELECT queries, return rowcount
+                                affected_rows = cursor.rowcount
+                                results.append({
+                                    "query_number": i + 1,
+                                    "sql": query,
+                                    "success": True,
+                                    "results": [],
+                                    "affected_rows": affected_rows,
+                                    "error": None
+                                })
+                        
+                        # If we get here, all queries succeeded - commit the transaction
+                        conn.commit()
+                        cursor.close()
+                        
+                        # Check if any schema-changing operations were performed
+                        schema_changed = self._detect_schema_changes(queries)
+                        if schema_changed:
+                            self._update_schema_from_queries(queries)
+                        
+                        return True, results, None
+                        
+                    except Exception as e:
+                        # Rollback the transaction on any error
+                        conn.rollback()
+                        cursor.close()
+                        
+                        # Add error info to the last result
+                        results.append({
+                            "query_number": len(results) + 1,
+                            "sql": queries[len(results)] if len(results) < len(queries) else "Unknown",
+                            "success": False,
+                            "results": [],
+                            "affected_rows": 0,
+                            "error": str(e)
+                        })
+                        
+                        return False, results, f"Transaction failed at query {len(results)}: {str(e)}"
+                        
+            else:
+                # Fallback to SQLAlchemy engine with transaction
+                with self.engine.begin() as transaction:
+                    try:
+                        for i, query in enumerate(queries):
+                            result = transaction.execute(text(query))
+                            
+                            if result.returns_rows:
+                                # Convert result to a list of dictionaries
+                                columns = result.keys()
+                                data = []
+                                for row in result:
+                                    row_dict = {}
+                                    for idx, column in enumerate(columns):
+                                        value = row[idx]
+                                        # Convert non-serializable types to strings for JSON compatibility
+                                        if isinstance(value, (pd.Timestamp, pd.Timedelta)):
+                                            value = str(value)
+                                        row_dict[column] = value
+                                    data.append(row_dict)
+                                
+                                results.append({
+                                    "query_number": i + 1,
+                                    "sql": query,
+                                    "success": True,
+                                    "results": data,
+                                    "affected_rows": len(data),
+                                    "error": None
+                                })
+                            else:
+                                # For non-SELECT queries, return rowcount
+                                affected_rows = result.rowcount
+                                results.append({
+                                    "query_number": i + 1,
+                                    "sql": query,
+                                    "success": True,
+                                    "results": [],
+                                    "affected_rows": affected_rows,
+                                    "error": None
+                                })
+                        
+                        # Transaction commits automatically if we reach here
+                        # Check if any schema-changing operations were performed
+                        schema_changed = self._detect_schema_changes(queries)
+                        if schema_changed:
+                            self._update_schema_from_queries(queries)
+                        
+                        return True, results, None
+                        
+                    except Exception as e:
+                        # Transaction rolls back automatically
+                        results.append({
+                            "query_number": len(results) + 1,
+                            "sql": queries[len(results)] if len(results) < len(queries) else "Unknown",
+                            "success": False,
+                            "results": [],
+                            "affected_rows": 0,
+                            "error": str(e)
+                        })
+                        
+                        return False, results, f"Transaction failed at query {len(results)}: {str(e)}"
+                
+        except Exception as e:
+            return False, results, f"Transaction setup failed: {str(e)}"
+
+    def _detect_schema_changes(self, queries: List[str]) -> bool:
+        """
+        Detect if any of the queries contain schema-changing operations
+        
+        Args:
+            queries: List of SQL queries to analyze
+            
+        Returns:
+            True if schema changes detected, False otherwise
+        """
+        schema_changing_keywords = [
+            'CREATE TABLE', 'DROP TABLE', 'ALTER TABLE', 
+            'CREATE INDEX', 'DROP INDEX', 'CREATE VIEW', 'DROP VIEW',
+            'CREATE SCHEMA', 'DROP SCHEMA', 'RENAME TABLE',
+            'ADD COLUMN', 'DROP COLUMN', 'RENAME COLUMN',
+            'CREATE SEQUENCE', 'DROP SEQUENCE', 'TRUNCATE TABLE'
+        ]
+        
+        for query in queries:
+            query_upper = query.upper().strip()
+            for keyword in schema_changing_keywords:
+                if keyword in query_upper:
+                    return True
+        
+        return False
+
+    def _update_schema_from_queries(self, queries: List[str]) -> None:
+        """
+        Update schema information based on executed queries without full re-analysis
+        
+        Args:
+            queries: List of executed SQL queries
+        """
+        if not self.schema_info:
+            # If no schema info exists, do full analysis
+            self.analyze_schema()
+            return
+        
+        try:
+            for query in queries:
+                self._process_schema_change_query(query)
+            
+            # Regenerate schema summary with updated info
+            self.schema_info["summary"] = self._generate_schema_summary(self.schema_info)
+            
+        except Exception as e:
+            print(f"Error updating schema from queries: {e}")
+            # Fallback to full re-analysis if incremental update fails
+            print("Falling back to full schema re-analysis...")
+            self.analyze_schema()
+
+    def _process_schema_change_query(self, query: str) -> None:
+        """
+        Process a single schema-changing query and update schema info
+        
+        Args:
+            query: SQL query that changes schema
+        """
+        query_upper = query.upper().strip()
+        
+        # Handle CREATE TABLE
+        if 'CREATE TABLE' in query_upper:
+            self._handle_create_table(query)
+        
+        # Handle DROP TABLE
+        elif 'DROP TABLE' in query_upper:
+            self._handle_drop_table(query)
+        
+        # Handle ALTER TABLE
+        elif 'ALTER TABLE' in query_upper:
+            self._handle_alter_table(query)
+        
+        # Handle CREATE INDEX
+        elif 'CREATE INDEX' in query_upper:
+            self._handle_create_index(query)
+        
+        # Handle DROP INDEX
+        elif 'DROP INDEX' in query_upper:
+            self._handle_drop_index(query)
+        
+        # Handle TRUNCATE TABLE
+        elif 'TRUNCATE TABLE' in query_upper:
+            self._handle_truncate_table(query)
+
+    def _handle_create_table(self, query: str) -> None:
+        """Handle CREATE TABLE query"""
+        try:
+            # Extract table name from query
+            import re
+            match = re.search(r'CREATE TABLE\s+(?:IF NOT EXISTS\s+)?(?:(\w+)\.)?(\w+)', query, re.IGNORECASE)
+            if match:
+                schema_name = match.group(1) or 'public'
+                table_name = match.group(2)
+                
+                # Get fresh table info from database
+                with self.engine.connect() as connection:
+                    table_info = self._get_table_info(table_name, connection, schema_name)
+                    
+                    # Add to schema info
+                    qualified_name = f"{schema_name}.{table_name}"
+                    self.schema_info["tables"][qualified_name] = table_info
+                    self.schema_info["tables"][table_name] = table_info
+                    
+                    print(f"Added new table to schema: {qualified_name}")
+        except Exception as e:
+            print(f"Error handling CREATE TABLE: {e}")
+
+    def _handle_drop_table(self, query: str) -> None:
+        """Handle DROP TABLE query"""
+        try:
+            import re
+            match = re.search(r'DROP TABLE\s+(?:IF EXISTS\s+)?(?:(\w+)\.)?(\w+)', query, re.IGNORECASE)
+            if match:
+                schema_name = match.group(1) or 'public'
+                table_name = match.group(2)
+                
+                # Remove from schema info
+                qualified_name = f"{schema_name}.{table_name}"
+                if qualified_name in self.schema_info["tables"]:
+                    del self.schema_info["tables"][qualified_name]
+                if table_name in self.schema_info["tables"]:
+                    del self.schema_info["tables"][table_name]
+                
+                # Remove related foreign keys
+                self._remove_table_relationships(table_name, schema_name)
+                
+                print(f"Removed table from schema: {qualified_name}")
+        except Exception as e:
+            print(f"Error handling DROP TABLE: {e}")
+
+    def _handle_alter_table(self, query: str) -> None:
+        """Handle ALTER TABLE query"""
+        try:
+            import re
+            # Extract table name
+            match = re.search(r'ALTER TABLE\s+(?:(\w+)\.)?(\w+)', query, re.IGNORECASE)
+            if match:
+                schema_name = match.group(1) or 'public'
+                table_name = match.group(2)
+                qualified_name = f"{schema_name}.{table_name}"
+                
+                # For ALTER TABLE, refresh the specific table info
+                if qualified_name in self.schema_info["tables"] or table_name in self.schema_info["tables"]:
+                    with self.engine.connect() as connection:
+                        updated_table_info = self._get_table_info(table_name, connection, schema_name)
+                        self.schema_info["tables"][qualified_name] = updated_table_info
+                        self.schema_info["tables"][table_name] = updated_table_info
+                        
+                        print(f"Updated table schema: {qualified_name}")
+                        
+                        # If it's adding/dropping foreign keys, update relationships
+                        if 'FOREIGN KEY' in query.upper() or 'DROP CONSTRAINT' in query.upper():
+                            # Re-analyze relationships for this schema
+                            self.schema_info["relationships"] = self._analyze_relationships([schema_name])
+        except Exception as e:
+            print(f"Error handling ALTER TABLE: {e}")
+
+    def _handle_create_index(self, query: str) -> None:
+        """Handle CREATE INDEX query"""
+        try:
+            import re
+            # Extract table name from CREATE INDEX
+            match = re.search(r'ON\s+(?:(\w+)\.)?(\w+)', query, re.IGNORECASE)
+            if match:
+                schema_name = match.group(1) or 'public'
+                table_name = match.group(2)
+                qualified_name = f"{schema_name}.{table_name}"
+                
+                # Refresh indexes for this table
+                if qualified_name in self.schema_info["tables"] or table_name in self.schema_info["tables"]:
+                    new_indexes = self.inspector.get_indexes(table_name, schema=schema_name)
+                    self.schema_info["tables"][qualified_name]["indexes"] = new_indexes
+                    self.schema_info["tables"][table_name]["indexes"] = new_indexes
+                    
+                    print(f"Updated indexes for table: {qualified_name}")
+        except Exception as e:
+            print(f"Error handling CREATE INDEX: {e}")
+
+    def _handle_drop_index(self, query: str) -> None:
+        """Handle DROP INDEX query"""
+        # Similar to create index but we need to refresh the table's index list
+        self._handle_create_index(query)  # Reuse the logic to refresh indexes
+
+    def _handle_truncate_table(self, query: str) -> None:
+        """Handle TRUNCATE TABLE query"""
+        try:
+            import re
+            match = re.search(r'TRUNCATE TABLE\s+(?:(\w+)\.)?(\w+)', query, re.IGNORECASE)
+            if match:
+                schema_name = match.group(1) or 'public'
+                table_name = match.group(2)
+                qualified_name = f"{schema_name}.{table_name}"
+                
+                # Update row count to 0 and clear sample data
+                if qualified_name in self.schema_info["tables"]:
+                    self.schema_info["tables"][qualified_name]["row_count"] = 0
+                    self.schema_info["tables"][qualified_name]["sample_data"] = None
+                if table_name in self.schema_info["tables"]:
+                    self.schema_info["tables"][table_name]["row_count"] = 0
+                    self.schema_info["tables"][table_name]["sample_data"] = None
+                
+                print(f"Updated row count for truncated table: {qualified_name}")
+        except Exception as e:
+            print(f"Error handling TRUNCATE TABLE: {e}")
+
+    def _remove_table_relationships(self, table_name: str, schema_name: str) -> None:
+        """Remove relationships involving a dropped table"""
+        if "relationships" not in self.schema_info:
+            return
+        
+        # Filter out relationships involving the dropped table
+        self.schema_info["relationships"] = [
+            rel for rel in self.schema_info["relationships"]
+            if not (
+                (rel["source_table"] == table_name and rel["source_schema"] == schema_name) or
+                (rel["target_table"] == table_name and rel["target_schema"] == schema_name)
+            )
+        ]
+
+    def refresh_schema_for_table(self, table_name: str, schema_name: str = "public") -> bool:
+        """
+        Refresh schema information for a specific table
+        
+        Args:
+            table_name: Name of the table to refresh
+            schema_name: Schema name (defaults to 'public')
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with self.engine.connect() as connection:
+                table_info = self._get_table_info(table_name, connection, schema_name)
+                
+                qualified_name = f"{schema_name}.{table_name}"
+                self.schema_info["tables"][qualified_name] = table_info
+                self.schema_info["tables"][table_name] = table_info
+                
+                print(f"Refreshed schema for table: {qualified_name}")
+                return True
+        except Exception as e:
+            print(f"Error refreshing schema for table {table_name}: {e}")
+            return False
 
 
 if __name__ == "__main__":
