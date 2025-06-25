@@ -1,9 +1,11 @@
 import { useState, useRef, useEffect } from 'react';
-import { Database, MessageSquare, Settings, Wifi, WifiOff } from 'lucide-react';
+import { Database, MessageSquare, Settings, Wifi, WifiOff, BarChart2, Plus, History, RefreshCw } from 'lucide-react';
 import Message from './Message';
 import SqlResult from './SqlResult';
 import SessionManager from './SessionManager';
-import { executeQuery, getSessionInfo, getPaginatedResults } from '../lib/api';
+import Dashboard from './Dashboard';
+import SessionsList from './SessionsList';
+import { executeQuery, getSessionInfo, getPaginatedResults, listWorkspaceSessions, createSession, activateWorkspace, getSessionMessages } from '../lib/api';
 
 // PaginationInfo interface to match the API response
 interface PaginationInfo {
@@ -52,7 +54,12 @@ interface PaginationState {
   currentPage: number;
 }
 
-export default function ChatBot() {
+interface ChatBotProps {
+  workspaceId?: string | null;
+  autoSessionId?: string | null;
+}
+
+export default function ChatBot({ workspaceId, autoSessionId }: ChatBotProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: 'welcome',
@@ -66,7 +73,11 @@ export default function ChatBot() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessionInfo, setSessionInfo] = useState<any>(null);
   const [showSessionManager, setShowSessionManager] = useState(false);
+  const [showSessionsList, setShowSessionsList] = useState(false);
   const [paginationState, setPaginationState] = useState<PaginationState | null>(null);
+  const [showDashboard, setShowDashboard] = useState(false);
+  const [savedQueries, setSavedQueries] = useState<any[]>([]);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -83,12 +94,32 @@ export default function ChatBot() {
     }
   }, [sessionId]);
 
+  // Handle auto session loading when workspace connects with a session ID
+  useEffect(() => {
+    if (autoSessionId && autoSessionId !== sessionId) {
+      handleSessionSelect(autoSessionId);
+    }
+  }, [autoSessionId]);
+
   const fetchSessionInfo = async () => {
     if (!sessionId) return;
     
     try {
       const info = await getSessionInfo(sessionId);
       setSessionInfo(info);
+      
+      // Check if the info returned is the fallback error object
+      if (info.error) {
+        // Add a message to the chat about the disconnected session
+        const errorMessage: ChatMessage = {
+          id: `session-error-${Date.now()}`,
+          isUser: false,
+          text: `⚠️ ${info.description}`,
+          timestamp: new Date(),
+        };
+        
+        setMessages(prev => [...prev, errorMessage]);
+      }
     } catch (error) {
       console.error('Error fetching session info:', error);
       setSessionId(null);
@@ -113,11 +144,49 @@ export default function ChatBot() {
     };
     
     setMessages((prev) => [...prev, userMessage]);
+    const currentInput = input;
     setInput('');
     setIsProcessing(true);
     
     try {
-      const result = await executeQuery(input, sessionId || undefined);
+      let currentSessionId = sessionId;
+      
+      // Auto-create session if none exists and workspace is connected
+      if (!currentSessionId && workspaceId) {
+        try {
+          const sessionData = await createSession({
+            workspace_id: workspaceId,
+            name: `Chat Session ${new Date().toLocaleString()}`,
+            description: 'Auto-created session'
+          });
+          
+          currentSessionId = sessionData._id;
+          setSessionId(currentSessionId);
+          
+          const systemMessage: ChatMessage = {
+            id: `system-${Date.now()}`,
+            isUser: false,
+            text: `✅ Created new session: ${sessionData.name}`,
+            timestamp: new Date(),
+          };
+          
+          setMessages((prev) => [...prev, systemMessage]);
+        } catch (error) {
+          console.error('Error auto-creating session:', error);
+          const errorMessage: ChatMessage = {
+            id: `error-${Date.now()}`,
+            isUser: false,
+            text: '❌ Failed to create session. Please try connecting to the workspace again.',
+            timestamp: new Date(),
+          };
+          
+          setMessages((prev) => [...prev, errorMessage]);
+          setIsProcessing(false);
+          return;
+        }
+      }
+      
+      const result = await executeQuery(currentInput, currentSessionId || undefined);
       
       let responseMessage = result.text || result.message || 'Query executed successfully.';
       const botMessage: ChatMessage = {
@@ -237,7 +306,7 @@ export default function ChatBot() {
               ...msg,
               analysisResult: {
                 ...msg.analysisResult,
-                tables: updatedTables,
+                tables: updatedTables
               }
             };
           }
@@ -245,17 +314,196 @@ export default function ChatBot() {
         })
       );
       
-      // Update pagination state
+      // Update the pagination state
       setPaginationState({
         messageId,
         tableId: currentTableId,
-        currentPage: newPage,
+        currentPage: newPage
       });
     } catch (error) {
       console.error('Error fetching paginated results:', error);
+      const errorMessage: ChatMessage = {
+        id: `pagination-error-${Date.now()}`,
+        isUser: false,
+        text: `Error loading page ${newPage}: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        timestamp: new Date(),
+      };
+      
+      setMessages((prev) => [...prev, errorMessage]);
     } finally {
       setIsProcessing(false);
     }
+  };
+
+  // New function to save a query to the dashboard
+  const handleSaveQuery = (query: any) => {
+    setSavedQueries(prev => [...prev, query]);
+  };
+
+  const handleNewChat = async () => {
+    if (!workspaceId) return;
+    
+    try {
+      const sessionData = await createSession({
+        workspace_id: workspaceId,
+        name: `Chat Session ${new Date().toLocaleString()}`,
+        description: 'New chat session'
+      });
+      
+      setSessionId(sessionData._id);
+      setMessages([
+        {
+          id: 'welcome',
+          isUser: false,
+          text: 'Hello! I can help you query your database using natural language. How can I help you today?',
+          timestamp: new Date(),
+        },
+      ]);
+      
+      const systemMessage: ChatMessage = {
+        id: `system-${Date.now()}`,
+        isUser: false,
+        text: `✅ Started new chat session: ${sessionData.name}`,
+        timestamp: new Date(),
+      };
+      
+      setMessages((prev) => [...prev, systemMessage]);
+    } catch (error) {
+      console.error('Error creating new chat:', error);
+    }
+  };
+
+  const handleRefreshConnection = async () => {
+    if (!workspaceId) return;
+    
+    try {
+      setIsRefreshing(true);
+      await activateWorkspace(workspaceId);
+      
+      const systemMessage: ChatMessage = {
+        id: `system-${Date.now()}`,
+        isUser: false,
+        text: '✅ Database connection refreshed successfully!',
+        timestamp: new Date(),
+      };
+      
+      setMessages((prev) => [...prev, systemMessage]);
+    } catch (error) {
+      console.error('Error refreshing connection:', error);
+      const errorMessage: ChatMessage = {
+        id: `error-${Date.now()}`,
+        isUser: false,
+        text: '❌ Failed to refresh database connection. Please check your connection settings.',
+        timestamp: new Date(),
+      };
+      
+      setMessages((prev) => [...prev, errorMessage]);
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
+
+  const loadSessionMessages = async (sessionId: string) => {
+    try {
+      const sessionMessages = await getSessionMessages(sessionId);
+      
+      // Convert session messages to ChatMessage format
+      const convertedMessages: ChatMessage[] = sessionMessages.map((msg: any) => {
+        const queryResult = msg.query_result;
+        
+        // Determine query type from the query_result
+        let queryType: 'conversational' | 'sql' | 'analysis' | undefined;
+        if (queryResult?.is_conversational) {
+          queryType = 'conversational';
+        } else if (queryResult?.is_multi_query || queryResult?.is_why_analysis) {
+          queryType = 'analysis';
+        } else if (queryResult?.sql) {
+          queryType = 'sql';
+        }
+        
+        return {
+          id: msg._id || `msg-${Date.now()}-${Math.random()}`,
+          isUser: msg.role === 'user',
+          text: msg.content,
+          timestamp: new Date(msg.created_at || Date.now()),
+          query_type: queryType,
+          sqlResult: queryResult && queryResult.sql ? {
+            sql: queryResult.sql || '',
+            data: queryResult.results,
+            error: queryResult.error,
+            pagination: queryResult.pagination,
+            table_id: queryResult.pagination?.table_id,
+          } : undefined,
+          analysisResult: queryResult && queryResult.tables ? {
+            tables: queryResult.tables || [],
+            analysis_type: queryResult.analysis_type
+          } : undefined
+        };
+      });
+
+      if (convertedMessages.length > 0) {
+        setMessages(convertedMessages);
+        
+        const systemMessage: ChatMessage = {
+          id: `system-${Date.now()}`,
+          isUser: false,
+          text: `✅ Loaded ${convertedMessages.length} messages from session`,
+          timestamp: new Date(),
+        };
+        
+        setMessages(prev => [...prev, systemMessage]);
+      } else {
+        // If no messages, start with welcome message
+        setMessages([
+          {
+            id: 'welcome',
+            isUser: false,
+            text: 'Hello! I can help you query your database using natural language. How can I help you today?',
+            timestamp: new Date(),
+          },
+        ]);
+        
+        const systemMessage: ChatMessage = {
+          id: `system-${Date.now()}`,
+          isUser: false,
+          text: '✅ Session loaded (no previous messages)',
+          timestamp: new Date(),
+        };
+        
+        setMessages(prev => [...prev, systemMessage]);
+      }
+    } catch (error) {
+      console.error('Error loading session messages:', error);
+      setMessages([
+        {
+          id: 'error-loading',
+          isUser: false,
+          text: '❌ Failed to load session messages. Starting with a fresh chat.',
+          timestamp: new Date(),
+        },
+      ]);
+    }
+  };
+
+  const handleSessionSelect = async (selectedSessionId: string) => {
+    setSessionId(selectedSessionId);
+    setShowSessionsList(false);
+    
+    // Clear current messages and show loading
+    setMessages([
+      {
+        id: 'loading',
+        isUser: false,
+        text: 'Loading session messages...',
+        timestamp: new Date(),
+      },
+    ]);
+    
+    // Load session messages
+    await loadSessionMessages(selectedSessionId);
+    
+    // Fetch session info
+    fetchSessionInfo();
   };
 
   return (
@@ -275,7 +523,42 @@ export default function ChatBot() {
             </div>
           </div>
           
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={handleNewChat}
+              disabled={!workspaceId}
+              className="flex items-center space-x-2 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white text-sm py-2.5 px-4 rounded-xl shadow-lg transition-all duration-300 transform hover:scale-105 hover:shadow-xl disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Plus className="h-4 w-4" />
+              <span>New Chat</span>
+            </button>
+
+            <button
+              onClick={() => setShowSessionsList(true)}
+              disabled={!workspaceId}
+              className="flex items-center space-x-2 bg-gradient-to-r from-blue-500 to-indigo-500 hover:from-blue-600 hover:to-indigo-600 text-white text-sm py-2.5 px-4 rounded-xl shadow-lg transition-all duration-300 transform hover:scale-105 hover:shadow-xl disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <History className="h-4 w-4" />
+              <span>Chat History</span>
+            </button>
+
+            <button
+              onClick={handleRefreshConnection}
+              disabled={!workspaceId || isRefreshing}
+              className="flex items-center space-x-2 bg-gradient-to-r from-orange-500 to-red-500 hover:from-orange-600 hover:to-red-600 text-white text-sm py-2.5 px-4 rounded-xl shadow-lg transition-all duration-300 transform hover:scale-105 hover:shadow-xl disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
+              <span>Refresh Connection</span>
+            </button>
+
+            <button
+              onClick={() => setShowDashboard(true)}
+              className="flex items-center space-x-2 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 text-white text-sm py-2.5 px-4 rounded-xl shadow-lg transition-all duration-300 transform hover:scale-105 hover:shadow-xl"
+            >
+              <BarChart2 className="h-4 w-4" />
+              <span>Dashboard</span>
+            </button>
+
             {sessionId ? (
               <div className="flex items-center bg-green-50 px-4 py-2 rounded-full border border-green-200 transition-all duration-300 hover:bg-green-100">
                 <Wifi className="h-4 w-4 text-green-600 mr-2" />
@@ -290,14 +573,6 @@ export default function ChatBot() {
                 <span className="text-sm text-gray-500">Not connected</span>
               </div>
             )}
-            
-            <button
-              onClick={() => setShowSessionManager(true)}
-              className="flex items-center space-x-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white text-sm py-2.5 px-4 rounded-xl shadow-lg transition-all duration-300 transform hover:scale-105 hover:shadow-xl"
-            >
-              <Database className="h-4 w-4" />
-              <span>{sessionId ? 'Change Connection' : 'Connect Database'}</span>
-            </button>
           </div>
         </div>
       </header>
@@ -329,6 +604,7 @@ export default function ChatBot() {
                       onPageChange={(page) => handlePageChange(message.id, message.sqlResult?.table_id || '', page)}
                       sessionId={sessionId || undefined}
                       tableId={message.sqlResult.table_id}
+                      onSaveToAnalytics={handleSaveQuery}
                     />
                   </div>
                 )}
@@ -345,6 +621,7 @@ export default function ChatBot() {
                           onPageChange={(page) => handlePageChange(message.id, table.table_id || '', page)}
                           sessionId={sessionId || undefined}
                           tableId={table.table_id}
+                          onSaveToAnalytics={handleSaveQuery}
                         />
                       </div>
                     ))}
@@ -412,6 +689,22 @@ export default function ChatBot() {
         onClose={() => setShowSessionManager(false)}
         onSessionCreated={handleSessionCreated}
       />
+
+      {/* Dashboard */}
+      <Dashboard 
+        isOpen={showDashboard}
+        onClose={() => setShowDashboard(false)}
+        savedQueries={savedQueries}
+      />
+
+      {/* Sessions List */}
+      {showSessionsList && workspaceId && (
+        <SessionsList 
+          workspaceId={workspaceId}
+          onClose={() => setShowSessionsList(false)}
+          onSessionSelect={handleSessionSelect}
+        />
+      )}
     </div>
   );
 }
