@@ -40,7 +40,7 @@ export default function WorkspaceForm({ workspace, onSubmit, onClose }: Workspac
       username: workspace?.db_connection.username || '',
       password: workspace?.db_connection.password || '',
       host: workspace?.db_connection.host || 'localhost',
-      port: workspace?.db_connection.port || '5432',
+      port: String(workspace?.db_connection.port || '5432'),
       db_type: workspace?.db_connection.db_type || 'postgresql'
     }
   });
@@ -67,9 +67,10 @@ export default function WorkspaceForm({ workspace, onSubmit, onClose }: Workspac
       newErrors.host = 'Host is required';
     }
 
-    if (!formData.db_connection.port.trim()) {
+    const portStr = String(formData.db_connection.port).trim();
+    if (!portStr) {
       newErrors.port = 'Port is required';
-    } else if (!/^\d+$/.test(formData.db_connection.port)) {
+    } else if (!/^\d+$/.test(portStr)) {
       newErrors.port = 'Port must be a number';
     }
 
